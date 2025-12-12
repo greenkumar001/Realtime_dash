@@ -8,6 +8,8 @@ import { Textarea } from "@/components/ui/textarea"
 import { Send, LogOut } from "lucide-react"
 import Link from "next/link"
 import { QuestionCard } from "@/components/question-card"
+import { AdminLoginModal } from "@/components/admin-login-modal"
+import { useWebSocket } from "@/hooks/use-websocket"
 
 type Question = {
   id: string
@@ -23,33 +25,68 @@ export default function ForumPage() {
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isAdmin, setIsAdmin] = useState(false)
   const [validationError, setValidationError] = useState("")
+  const [loginModalOpen, setLoginModalOpen] = useState(false)
+  const [isLoggingIn, setIsLoggingIn] = useState(false)
+  const API_URL = (process.env.NEXT_PUBLIC_API_URL as string) ?? "http://localhost:8000"
 
+  const handleAdminLogin = async (username: string, password: string) => {
+    try {
+      const res = await fetch(`${API_URL}/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.detail || "Login failed")
+      }
+      const data = await res.json()
+      const token = data.access_token
+      localStorage.setItem("access_token", token)
+      const meRes = await fetch(`${API_URL}/me`, { headers: { "Authorization": `Bearer ${token}` } })
+      if (!meRes.ok) throw new Error("Failed to verify user")
+      const me = await meRes.json()
+      if (me.is_admin) {
+        setIsAdmin(true)
+      } else {
+        throw new Error("User is not an admin")
+      }
+    } catch (e: any) {
+      throw new Error(e.message || "Login error")
+    }
+  }
+
+  const handleAdminLogout = () => {
+    localStorage.removeItem("access_token")
+    setIsAdmin(false)
+  }
 
   useEffect(() => {
-    setQuestions([
-      {
-        id: "1",
-        message: "How do I reset my password?",
-        timestamp: new Date(Date.now() - 3600000),
-        status: "Pending",
-        answers: [],
-      },
-      {
-        id: "2",
-        message: "What are the system requirements?",
-        timestamp: new Date(Date.now() - 7200000),
-        status: "Escalated",
-        answers: ["You need at least 8GB RAM and a modern browser."],
-      },
-      {
-        id: "3",
-        message: "How can I upgrade my account?",
-        timestamp: new Date(Date.now() - 10800000),
-        status: "Answered",
-        answers: ["Go to Settings > Billing to upgrade your plan."],
-      },
-    ])
-  }, [])
+    let mounted = true
+    const fetchQuestions = async () => {
+      try {
+        const res = await fetch(`${API_URL}/questions`)
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const data = await res.json()
+        if (!mounted) return
+        const mapped = data.map((q: any) => ({
+          id: String(q.question_id),
+          message: q.message,
+          timestamp: new Date(q.timestamp),
+          status: q.status,
+          answers: (q.answers || []).map((a: any) => a.content),
+        }))
+        setQuestions(mapped)
+      } catch (e) {
+        console.error("Failed to load questions", e)
+      }
+    }
+
+    fetchQuestions()
+    return () => {
+      mounted = false
+    }
+  }, [API_URL])
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -61,6 +98,53 @@ export default function ForumPage() {
 
     return () => clearInterval(interval)
   }, [])
+
+  useEffect(() => {
+    const token = localStorage.getItem("access_token")
+    if (!token) return
+    ;(async () => {
+      try {
+        const res = await fetch(`${API_URL}/me`, { headers: { "Authorization": `Bearer ${token}` } })
+        if (!res.ok) { localStorage.removeItem("access_token"); return }
+        const me = await res.json()
+        if (me.is_admin) setIsAdmin(true)
+      } catch (e) {
+        console.error("me check failed", e)
+      }
+    })()
+  }, [API_URL])
+
+  // WebSocket for real-time updates
+  useWebSocket({
+    url: `${API_URL.replace("http", "ws")}/ws`,
+    onMessage: (msg) => {
+      if (msg.type === "new_question") {
+        const q = msg.question
+        const newQ: Question = {
+          id: String(q.question_id),
+          message: q.message,
+          timestamp: new Date(q.timestamp),
+          status: q.status as any,
+          answers: [],
+        }
+        setQuestions((prev) => [newQ, ...prev])
+      } else if (msg.type === "new_answer") {
+        const a = msg.answer
+        setQuestions((prev) =>
+          prev.map((q) => (q.id === String(a.question_id) ? { ...q, answers: [...q.answers, a.content] } : q))
+        )
+      } else if (msg.type === "question_updated") {
+        const updated = msg.question
+        setQuestions((prev) =>
+          prev.map((q) =>
+            q.id === String(updated.question_id)
+              ? { ...q, status: updated.status as any, escalated: updated.escalated }
+              : q
+          )
+        )
+      }
+    },
+  })
 
   const validateQuestionWithAJAX = (question: string): Promise<boolean> => {
     return new Promise((resolve, reject) => {
@@ -111,35 +195,68 @@ export default function ForumPage() {
         return
       }
 
-      const question: Question = {
-        id: Date.now().toString(),
-        message: newQuestion,
-        timestamp: new Date(),
-        status: "Pending",
+      const res = await fetch(`${API_URL}/questions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: newQuestion }),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const created = await res.json()
+      const mapped: Question = {
+        id: String(created.question_id),
+        message: created.message,
+        timestamp: new Date(created.timestamp),
+        status: created.status,
         answers: [],
       }
-
-      setTimeout(() => {
-        setQuestions((prev) => [question, ...prev])
-        setNewQuestion("")
-        setIsSubmitting(false)
-      }, 500)
+      setQuestions((prev) => [mapped, ...prev])
+      setNewQuestion("")
+      setIsSubmitting(false)
     } catch (error) {
       setValidationError("An error occurred. Please try again.")
       setIsSubmitting(false)
     }
   }
 
-  const handleSubmitAnswer = (questionId: string, answer: string) => {
-    setQuestions((prev) => prev.map((q) => (q.id === questionId ? { ...q, answers: [...q.answers, answer] } : q)))
+  const handleSubmitAnswer = async (questionId: string, answer: string) => {
+    try {
+      const token = localStorage.getItem("access_token")
+      const headers: Record<string, string> = { "Content-Type": "application/json" }
+      if (token) headers["Authorization"] = `Bearer ${token}`
+      const res = await fetch(`${API_URL}/questions/${questionId}/answers`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ content: answer }),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const created = await res.json()
+      setQuestions((prev) => prev.map((q) => (q.id === questionId ? { ...q, answers: [...q.answers, created.content] } : q)))
+    } catch (e) {
+      console.error("Failed to submit answer", e)
+    }
   }
 
-  const handleMarkAnswered = (questionId: string) => {
+  const handleMarkAnswered = async (questionId: string) => {
     if (!isAdmin) {
       alert("Only administrators can mark questions as answered.")
       return
     }
-    setQuestions((prev) => prev.map((q) => (q.id === questionId ? { ...q, status: "Answered" } : q)))
+    try {
+      const token = localStorage.getItem("access_token")
+      if (!token) { alert("No admin token found"); return }
+      const res = await fetch(`${API_URL}/questions/${questionId}/answer`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${token}` },
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.detail || `HTTP ${res.status}`)
+      }
+      setQuestions((prev) => prev.map((q) => (q.id === questionId ? { ...q, status: "Answered" } : q)))
+    } catch (e) {
+      console.error("Failed to mark answered", e)
+      alert("Failed to mark as answered")
+    }
   }
 
   const handleEscalate = (questionId: string) => {
@@ -157,6 +274,7 @@ export default function ForumPage() {
   })
 
   return (
+    <>
     <div className="min-h-screen bg-background">
       {/* Header */}
       <header className="bg-primary border-b border-border sticky top-0 z-50 backdrop-blur-sm shadow-lg">
@@ -174,7 +292,7 @@ export default function ForumPage() {
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => setIsAdmin(false)}
+                    onClick={handleAdminLogout}
                     className="bg-white/10 text-white border-white/30 hover:bg-white/20"
                   >
                     <LogOut className="mr-2 h-4 w-4" />
@@ -186,7 +304,7 @@ export default function ForumPage() {
                   <span className="text-white text-sm bg-white/20 px-3 py-1 rounded-full">Guest</span>
                   <Button
                     variant="outline"
-                    onClick={() => setIsAdmin(true)}
+                    onClick={() => setLoginModalOpen(true)}
                     className="bg-white/10 text-white border-white/30 hover:bg-white/20"
                   >
                     Admin Login
@@ -267,5 +385,13 @@ export default function ForumPage() {
         </div>
       </div>
     </div>
+
+    <AdminLoginModal
+      open={loginModalOpen}
+      onOpenChange={setLoginModalOpen}
+      onLogin={handleAdminLogin}
+      isLoading={isLoggingIn}
+    />
+    </>
   )
 }
